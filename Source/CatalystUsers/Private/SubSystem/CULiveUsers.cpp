@@ -2,10 +2,12 @@
 #include "CUUsersEndpoint.h"
 #include "Engine/GameInstance.h"
 #include "Log/CFLog.h"
+#include "Misc/ScopeExit.h"
 bool UCUSubsystem::ConfigureLiveUsers(const FCULiveUserPolicy& Policy)
 {
     if (Policy.MaximumObjects < FMath::Max(1, Tracked.Num()) || Policy.MaximumObjects > 256 ||
         !FMath::IsFinite(Policy.RefreshInterval) || Policy.RefreshInterval < .02f) { return false; }
+    if (!Policy.bAutomaticRefresh) { ResetFeed(); }
     LivePolicy = Policy; if (Endpoint) { Endpoint->NextRefresh = 0; Endpoint->Refresh.Empty(); Endpoint->RefreshIndex = 0; } return true;
 }
 void UCUSubsystem::Report(UCUUser* User, ECUUserFabricError Error)
@@ -26,7 +28,6 @@ void UCUSubsystem::FailOperation(UCUUserOperation* Operation, ECUUserFabricError
 }
 bool UCUSubsystem::Track(UCUUser* User)
 {
-    for (auto It = Identities.CreateIterator(); It; ++It) { if (!It.Value().IsValid()) { It.RemoveCurrent(); } }
     Tracked.RemoveAll([](const auto& W) { return !W.IsValid(); });
     if (!Tracked.Contains(User)) {
         if (Tracked.Num() >= LivePolicy.MaximumObjects) { return false; } Tracked.Add(User);
@@ -67,6 +68,7 @@ UCUUserOperation* UCUSubsystem::GetUser(const FString& Name)
 void UCUSubsystem::PrepareLive(int32 Index, uint64 Generation)
 {
     auto Selected = Endpoint;
+    if (Index == 0) { ResetFeed(); }
     if (Index == Selected->Live.Num()) { Selected->Generation = Generation; Selected->bPreparing = false; return; }
     TWeakObjectPtr<UCUSubsystem> Weak(this);
     Selected->Live[Index]->Prepare(this, [Weak, Selected, Index, Generation](bool Ready) {
@@ -117,17 +119,28 @@ void UCUSubsystem::RefreshOne(UCUUser* User)
     const bool Recovering = User->Replica.Identifier.IsEmpty();
     const bool Updating = !Recovering && User->Replica.HasEdits() &&
         (User->Replica.Phase == ECCObjectReplicaPhase::Live || User->Replica.Phase == ECCObjectReplicaPhase::Stale);
+    const bool Subscribing = !Recovering && !Updating && LivePolicy.bAutomaticRefresh && !Selected->Subscribed.Contains(User->Replica.Identifier);
+    if (Recovering && !Selected->bExplicitRefresh && Selected->RecoveryAttempted.Contains(User)) { Selected->bBusy = false; return; }
+    if (Recovering) { Selected->RecoveryAttempted.Add(User); }
+    if (!Recovering && !Updating && !Subscribing && !Selected->bExplicitRefresh) { Selected->bBusy = false; return; }
+    if (Updating) { Selected->Updating.Add(User); }
     FCUUserChange Request;
     Request.UserIdentifier = User->Replica.Identifier; Request.Name = User->Name; Request.ExpectedRevision = User->Replica.EditBase;
     Request.OperationIdentifier = Recovering ? User->CreationKey : FGuid::NewGuid().ToString();
+    if (Subscribing) { Request.OperationIdentifier = Selected->FeedKey; Request.ExpectedRevision = User->Replica.Revision; }
     const uint64 Sequence = User->Replica.EditSequence;
     TWeakObjectPtr<UCUSubsystem> Weak(this); TWeakObjectPtr<UCUUser> Target(User);
-    Selected->Live[Recovering ? 3 : Updating ? 2 : 1]->Call(this, Request,
-        [Weak, Selected, Target, Recovering, Updating, Sequence](TCCObjectResult<FCULiveUserState> Result) {
+    Selected->Live[Recovering ? 3 : Updating ? 2 : Subscribing ? 4 : 1]->Call(this, Request,
+        [Weak, Selected, Target, Recovering, Updating, Subscribing, Sequence](TCCObjectResult<FCULiveUserState> Result) {
             auto* Self = Weak.Get(); auto* User = Target.Get();
             if (!Self || Self->Endpoint != Selected || !Self->bInitialized) { return; }
             Selected->bBusy = false;
             if (!User || User->Context.Get() != Self) { return; }
+            ON_SCOPE_EXIT {
+                Selected->Updating.Remove(User);
+                if (auto* Deferred = Selected->DeferredStates.Find(User); Deferred && Deferred->Revision > User->Replica.Revision) { Self->Install(User, *Deferred); }
+                Selected->DeferredStates.Remove(User);
+            };
             if (Result.Outcome != ECCObjectOutcome::Completed || !Result.Value.IsSet()) {
                 User->Replica.Phase = ECCObjectReplicaPhase::Uncertain; Selected->Generation = 0;
                 Self->Report(User, ECUUserFabricError::Unknown); User->OnChanged.Broadcast(User); return;
@@ -140,6 +153,7 @@ void UCUSubsystem::RefreshOne(UCUUser* User)
                 State.Outcome == TEXT("updated") || State.Outcome == TEXT("conflict") : State.Outcome == TEXT("current"))) {
                 User->Replica.Phase = ECCObjectReplicaPhase::Uncertain; Self->Report(User, ECUUserFabricError::IncompatibleState); return;
             }
+            if (Subscribing) { Selected->Subscribed.Add(User->Replica.Identifier); }
             TOptional<uint64> Sent;
             if (Recovering && State.Outcome == TEXT("created")) { Sent = User->CreationSequence; }
             if (Updating && State.Outcome == TEXT("updated")) { Sent = Sequence; }
@@ -159,6 +173,7 @@ void UCUSubsystem::Tick(float)
         for (auto Weak : Tracked) { if (auto* User = Weak.Get(); User && User->Replica.Phase == ECCObjectReplicaPhase::Live) { User->Replica.Phase = ECCObjectReplicaPhase::Stale; User->OnChanged.Broadcast(User); } }
         return;
     }
+    if (!Selected->bPreparing && Generation == Selected->Generation) { ReceiveChanges(); }
     if (Selected->bBusy || Selected->bPreparing) { return; }
     const double Now = FPlatformTime::Seconds();
     if (Generation != Selected->Generation) {
@@ -167,9 +182,18 @@ void UCUSubsystem::Tick(float)
     }
     for (auto Operation : Operations) { if (!Operation->IsFinished()) { SendOperation(Operation); return; } }
     Tracked.RemoveAll([](const auto& Weak) { return !Weak.IsValid(); });
+    for (auto It = Identities.CreateIterator(); It; ++It) {
+        if (!It.Value().IsValid()) {
+            const FString Identifier = It.Key(); It.RemoveCurrent();
+            if (Selected->Subscribed.Remove(Identifier)) {
+                Selected->bBusy = true; FCUUserChange Change; Change.OperationIdentifier = Selected->FeedKey; Change.UserIdentifier = Identifier;
+                Selected->Live[6]->Call(this, Change, [Selected](TCCObjectResult<FCULiveUserState>) { Selected->bBusy = false; }); return;
+            }
+        }
+    }
     if (Selected->RefreshIndex >= Selected->Refresh.Num()) {
         if ((!LivePolicy.bAutomaticRefresh && !bRefreshRequested) || Now < Selected->NextRefresh) { return; }
-        Selected->Refresh = Tracked; Selected->RefreshIndex = 0; bRefreshRequested = false;
+        Selected->Refresh = Tracked; Selected->RefreshIndex = 0; Selected->bExplicitRefresh = bRefreshRequested; bRefreshRequested = false;
         Selected->NextRefresh = Now + LivePolicy.RefreshInterval;
     }
     while (Selected->RefreshIndex < Selected->Refresh.Num()) {
@@ -185,5 +209,47 @@ void UCUSubsystem::ResolveConflict(UCUUser* User, bool KeepLocal)
     if (!User || User->Context.Get() != this) { return; }
     if (KeepLocal) { User->Replica.RebaseLocal(); }
     else { User->Replica.AcceptRemote(); User->Name = User->Accepted.Name; }
-    User->LastError = ECUUserFabricError::None; User->OnChanged.Broadcast(User); RefreshLiveUsers();
+    User->LastError = ECUUserFabricError::None; User->OnChanged.Broadcast(User); if (KeepLocal) { RefreshLiveUsers(); }
+}
+
+void UCUSubsystem::ResetFeed()
+{
+    if (!Endpoint) { return; } auto Selected = Endpoint;
+    ++Selected->FeedGeneration;
+    if (Selected->ReceiveRequest.RequestId) {
+        GetGameInstance()->GetSubsystem<UCCSubsystem>()->RetireRequest(Selected->Connection, Selected->ReceiveRequest.RequestId, Selected->ReceiveRequest.Generation);
+    }
+    Selected->ReceiveRequest = {}; Selected->bReceiving = false; Selected->FeedKey = FGuid::NewGuid().ToString();
+    Selected->AcknowledgedIdentifier.Empty(); Selected->AcknowledgedRevision = 0; Selected->Subscribed.Empty(); Selected->RecoveryAttempted.Empty();
+}
+void UCUSubsystem::ReceiveChanges()
+{
+    auto Selected = Endpoint;
+    if (!LivePolicy.bAutomaticRefresh || Selected->bReceiving || Selected->Subscribed.IsEmpty()) { return; }
+    FCUUserChange Change; Change.OperationIdentifier = Selected->FeedKey;
+    Change.UserIdentifier = Selected->AcknowledgedIdentifier; Change.ExpectedRevision = Selected->AcknowledgedRevision;
+    const uint64 Stamp = Selected->FeedGeneration; Selected->bReceiving = true;
+    TWeakObjectPtr<UCUSubsystem> Weak(this);
+    Selected->ReceiveRequest = Selected->Live[5]->Call(this, Change, [Weak, Selected, Stamp](TCCObjectResult<FCULiveUserState> Result) {
+        auto* Self = Weak.Get();
+        if (!Self || !Self->bInitialized || Self->Endpoint != Selected || Stamp != Selected->FeedGeneration) { return; }
+        Selected->bReceiving = false; Selected->ReceiveRequest = {};
+        if (Result.Outcome != ECCObjectOutcome::Completed || !Result.Value.IsSet()) {
+            for (auto Target : Self->Tracked) { if (auto* User = Target.Get()) {
+                if (User->Replica.Phase == ECCObjectReplicaPhase::Live) { User->Replica.Phase = ECCObjectReplicaPhase::Stale; }
+                Self->Report(User, ECUUserFabricError::Unknown);
+            } }
+            Selected->Generation = 0; Self->ResetFeed(); return;
+        }
+        const auto& State = Result.Value.GetValue();
+        if (State.Outcome == TEXT("renew")) { return; }
+        if (State.Outcome != TEXT("current") || !Selected->Subscribed.Contains(State.UserIdentifier)) { Selected->Generation = 0; Self->ResetFeed(); return; }
+        Selected->AcknowledgedIdentifier = State.UserIdentifier; Selected->AcknowledgedRevision = State.Revision;
+        if (auto* WeakUser = Self->Identities.Find(State.UserIdentifier)) {
+            if (auto* User = WeakUser->Get()) {
+                if (Selected->Updating.Contains(User)) { Selected->DeferredStates.Add(User, State); }
+                else if (State.Revision > User->Replica.Revision) { Self->Install(User, State); }
+            }
+        }
+    });
 }

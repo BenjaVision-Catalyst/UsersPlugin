@@ -173,4 +173,70 @@ bool FCUCreateUserTest::RunTest(const FString&)
     UE_LOG(LogTemp, Display, TEXT("CU_LIVE_RESULT %s adopted stable-identity shared-cache auto-refresh conflict lost-create-recovered rollback-absent"), *Prefix);
     return true;
 }
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCUPushUserTest, "Catalyst.Users.Native.Push",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FCUPushUserTest::RunTest(const FString&)
+{
+    FString Path, Directory, Json;
+    if (!FParse::Value(FCommandLine::Get(), TEXT("CUFixture="), Path) ||
+        !FParse::Value(FCommandLine::Get(), TEXT("CUOutput="), Directory) || !FFileHelper::LoadFileToString(Json, *Path)) { AddError(TEXT("Use the Users push runner")); return false; }
+    TSharedPtr<FJsonObject> Options;
+    if (!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Options)) { return false; }
+    const FString Prefix = Options->GetStringField(TEXT("prefix")); FString Authority; Options->TryGetStringField(TEXT("authority"), Authority);
+    FCCConnectProfile Profile; Profile.BindAddress = TEXT("127.0.0.1:0"); Profile.PeerAddress = Options->GetStringField(TEXT("peer"));
+    Profile.ServerName = TEXT("localhost"); Profile.Capacity = 4;
+    Profile.CertificatePath = Options->GetStringField(TEXT("certificate")); Profile.PrivateKeyPath = Options->GetStringField(TEXT("private_key")); Profile.TrustedCertificatePath = Options->GetStringField(TEXT("trusted_certificate"));
+    FInstance Main, Remote;
+    auto* Connect = Main.Game->GetSubsystem<UCCSubsystem>(); auto* Users = Main.Game->GetSubsystem<UCUSubsystem>();
+    auto* RemoteConnect = Remote.Game->GetSubsystem<UCCSubsystem>(); auto* Observers = Remote.Game->GetSubsystem<UCUSubsystem>();
+    const FName Name(TEXT("Users"));
+    Connect->ConfigureConnection(Name, Profile); RemoteConnect->ConfigureConnection(Name, Profile); Connect->StartConnection(Name); RemoteConnect->StartConnection(Name);
+    auto Wait = [&](TFunction<bool()> Done) {
+        const double Deadline = FPlatformTime::Seconds() + 25;
+        while (!Done() && FPlatformTime::Seconds() < Deadline) { Connect->Tick(0); Users->Tick(0); RemoteConnect->Tick(0); Observers->Tick(0); FPlatformProcess::SleepNoStats(.001f); }
+        return Done();
+    };
+    auto Pause = [&](double Seconds) { const double Until = FPlatformTime::Seconds() + Seconds; return Wait([&] { return FPlatformTime::Seconds() >= Until; }); };
+    if (!Wait([&] { return Connect->GetConnectionState(Name) == ECCConnectState::Ready && RemoteConnect->GetConnectionState(Name) == ECCConnectState::Ready; })) { AddError(TEXT("Connections failed")); return false; }
+    Users->UseConnection(Name); Observers->UseConnection(Name);
+    FCULiveUserPolicy Manual; Manual.bAutomaticRefresh = false; Manual.RefreshInterval = .05f; Users->ConfigureLiveUsers(Manual);
+    FCULiveUserPolicy Automatic = Manual; Automatic.bAutomaticRefresh = true; Observers->ConfigureLiveUsers(Automatic);
+    TStrongObjectPtr<UCUUser> Original{NewObject<UCUUser>(Main.Game.Get())}; Original->SetUserName(Prefix + TEXT(":push-original"));
+    TStrongObjectPtr<UCUUserOperation> Created{Users->CreateUser(Original.Get())};
+    if (!Wait([&] { return Created->IsFinished(); }) || Created->GetError() != ECUUserFabricError::None) { AddError(TEXT("Creation failed")); return false; }
+    TestTrue(TEXT("Original adopted"), Created->GetUser() == Original.Get());
+    TStrongObjectPtr<UCUUserOperation> Cached{Users->GetUser(Original->GetUserName())};
+    TestTrue(TEXT("Identity cached"), Wait([&] { return Cached->IsFinished(); }) && Cached->GetUser() == Original.Get());
+    TStrongObjectPtr<UCUUserOperation> Lookup{Observers->GetUser(Original->GetUserName())};
+    if (!Wait([&] { return Lookup->IsFinished(); }) || Lookup->GetError() != ECUUserFabricError::None) { AddError(TEXT("Observer lookup failed")); return false; }
+    auto Marker = [&](const TCHAR* File) { FFileHelper::SaveStringToFile(FString::Printf(TEXT("{\"prefix\":\"%s\"}"), *Prefix), *(Directory / File)); };
+    TStrongObjectPtr<UCUUser> Observed{Lookup->GetUser()}; Pause(.3);
+    Marker(TEXT("idle-start.json")); Pause(16); Marker(TEXT("idle-end.json"));
+    Original->SetUserName(Prefix + TEXT(":push-held")); Users->RefreshLiveUsers();
+    TestTrue(TEXT("Change reaches observer after finalization"), Wait([&] { return !Original->HasPendingEdits() && Observed->GetUserName() == Prefix + TEXT(":push-held"); }));
+
+    Marker(TEXT("push-observed.json"));
+    if (Authority != TEXT("gt")) {
+        Original->SetUserName(Prefix + TEXT(":push-rollback")); Users->RefreshLiveUsers();
+        TestTrue(TEXT("Failed edit remains unknown"), Wait([&] { return Original->GetSyncState() == ECCObjectReplicaPhase::Uncertain; }));
+        Pause(.3); TestEqual(TEXT("Rollback is never pushed"), Observed->GetUserName(), Prefix + TEXT(":push-held")); TestEqual(TEXT("Rollback leaves revision"), Observed->GetRevision(), int64(2));
+        Users->RefreshLiveUsers(); Pause(.3); Users->ResolveConflict(Original.Get(), false);
+    }
+    Original->SetUserName(Prefix + TEXT(":local-draft")); Observed->SetUserName(Prefix + TEXT(":push-authority"));
+    TestTrue(TEXT("Observer submits edit"), Wait([&] { return !Observed->HasPendingEdits(); }));
+    Users->RefreshLiveUsers(); TestTrue(TEXT("Conflict retains draft"), Wait([&] { return Original->GetSyncState() == ECCObjectReplicaPhase::Conflict; }) && Original->GetUserName() == Prefix + TEXT(":local-draft"));
+    Users->ResolveConflict(Original.Get(), false);
+    Connect->StopConnection(Name); Observed->SetUserName(Prefix + TEXT(":push-disconnected"));
+    TestTrue(TEXT("Change while disconnected commits"), Wait([&] { return !Observed->HasPendingEdits(); }));
+    Users->ConfigureLiveUsers(Automatic); Connect->StartConnection(Name);
+    TestTrue(TEXT("Reconnect resnapshots subscription"), Wait([&] { return Original->GetUserName() == Prefix + TEXT(":push-disconnected"); }));
+    Observed->SetUserName(Prefix + TEXT(":push-reconnected"));
+    TestTrue(TEXT("Push resumes without manual prepare or read"), Wait([&] { return !Observed->HasPendingEdits() && Original->GetUserName() == Observed->GetUserName(); }));
+    TStrongObjectPtr<UCUUserOperation> Recovered{Users->GetUser(Original->GetUserName())};
+    TestTrue(TEXT("Identity survives reconnect"), Wait([&] { return Recovered->IsFinished(); }) && Recovered->GetUser() == Original.Get());
+    TestEqual(TEXT("Stable identifier"), Original->GetUserIdentifier(), Observed->GetUserIdentifier());
+    Marker(TEXT("push-success.json"));
+    UE_LOG(LogTemp, Display, TEXT("CU_PUSH_RESULT %s no-periodic-reads pushed-after-finalization stable-identity conflict reconnect"), *Prefix);
+    return true;
+}
 #endif

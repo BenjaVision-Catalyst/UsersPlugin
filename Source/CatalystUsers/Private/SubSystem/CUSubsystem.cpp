@@ -9,7 +9,7 @@ void UCUSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 { Collection.InitializeDependency<UCCSubsystem>(); Super::Initialize(Collection); bInitialized = true; SetTickableTickType(ETickableTickType::Conditional); }
 void UCUSubsystem::Deinitialize()
 {
-    bInitialized = false; SetTickableTickType(ETickableTickType::Never);
+    ResetFeed(); bInitialized = false; SetTickableTickType(ETickableTickType::Never);
     auto Pending = Operations; Operations.Empty();
     for (auto Operation : Pending) { FailOperation(Operation, ECUUserFabricError::Unknown); }
     for (auto Weak : Tracked) { if (auto* User = Weak.Get()) { User->Replica.Phase = ECCObjectReplicaPhase::Stale; User->OnChanged.Broadcast(User); } }
@@ -23,7 +23,7 @@ bool UCUSubsystem::UseConnection(FName Name)
     auto Lookup = TCCObjectEndpoint<FCUUserLookup, FCUUser>::Create(GetGameInstance()->GetSubsystem<UCCSubsystem>(), Name, 2);
     if (!Bound || !Lookup) { return false; }
     Endpoint = MakeShared<FCCUsersEndpoint>(); Endpoint->Binding = Bound; Endpoint->Lookup = Lookup; Endpoint->Connection = Name;
-    for (uint16 Code = 3; Code <= 6; ++Code) {
+    for (uint16 Code = 3; Code <= 9; ++Code) {
         auto Live = TCCObjectEndpoint<FCUUserChange, FCULiveUserState>::Create(GetGameInstance()->GetSubsystem<UCCSubsystem>(), Name, Code, ECCObjectProfile::StateV2);
         if (!Live) { Endpoint.Reset(); return false; } Endpoint->Live.Add(Live);
     }

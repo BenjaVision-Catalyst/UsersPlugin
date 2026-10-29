@@ -63,4 +63,6 @@ private:
     bool Install(UCUUser* User, const FCULiveUserState& State, TOptional<uint64> Sent = {});
     void SendOperation(UCUUserOperation* Operation);
     void RefreshOne(UCUUser* User);
+    void ResetFeed();
+    void ReceiveChanges();
 };

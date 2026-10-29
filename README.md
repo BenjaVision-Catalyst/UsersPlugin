@@ -20,8 +20,9 @@ Observe OnChanged/OnError, sync state and pending edits; subscribe to the subsys
 OnFabricError for scope errors. MagritteDescription uses our C++ port and native
 accessors, with server-owned fields read-only, ready for future generated UI.
 
-One bounded coordinator refreshes full state and submits edits. ConfigureLiveUsers
-changes capacity/interval/automatic refresh live. Disable automatic refresh and
+One bounded change feed receives server-pushed state while the coordinator submits
+edits. ConfigureLiveUsers changes capacity, local edit-check interval and automatic
+synchronization live. Disable automatic refresh and
 call RefreshLiveUsers for explicit control. Conflicts retain drafts; ResolveConflict
 accepts remote state or explicitly rebases local state. Uncertain writes never
 replay automatically. The caller owns reconnect; the Fabric renegotiates and recovers
@@ -29,7 +30,7 @@ creation receipts on the same connection scope. UseConnection refuses retargetin
 while Users/operations are retained. Current update permission is creator-peer scoped;
 account/tenant authorization is future work.
 
-Enable server operations 3/4/5/6/65534 and an authoritative Users binding.
+Enable server operations 3/4/5/6/7/8/9/65534 and an authoritative Users binding.
 Legacy 1/2 use Prepare, CreateUserSnapshot and GetUserSnapshot with FCUUserSnapshot;
 FCUUser remains a C++ alias. Legacy Blueprint nodes use Snapshot names. Only
 Completed carries a valid snapshot, and reconnect requires fresh legacy Prepare.
@@ -39,7 +40,14 @@ after staging Connect's pinned Quinn/Magritte archives. See the service reposito
 `docs/Connect-CreateUser.md` for protocol, recovery limits and security scope.
 `Catalyst.Users.Native.CreateUser` and `scripts/qualify-platform-users.py` exercise
 the actual subsystems against a configured GemStone authority. No generated UI,
-push subscription, graph/4 transfer or non-Mac engine qualification is claimed.
+graph/4 transfer or non-Mac engine qualification is claimed.
+
+GemStone authorities deliver changes after commit. GT authorities deliver after
+volatile Runtime finalization, without claiming persistence/rollback. The feed
+reuses deferred replies, coalesces by User identity, and renews on change or a
+bounded lease heartbeat. Reconnect resubscribes/resnapshots; unknown mutations are
+never automatically replayed. See service documentation for configurable feed
+limits and the dedicated `--push-only --authority gt` native qualification.
 
 ## License
 

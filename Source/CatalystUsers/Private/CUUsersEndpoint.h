@@ -11,6 +11,14 @@ public:
     TArray<TSharedPtr<TCCObjectEndpoint<FCUUserChange, FCULiveUserState>>> Live;
     FName Connection;
     uint64 Generation = 0;
+    FString FeedKey, AcknowledgedIdentifier;
+    int64 AcknowledgedRevision = 0;
+    uint64 FeedGeneration = 0;
+    FCCConnectRequestResult ReceiveRequest;
+    TSet<FString> Subscribed;
+    TSet<TWeakObjectPtr<UCUUser>> RecoveryAttempted, Updating;
+    TMap<TWeakObjectPtr<UCUUser>, FCULiveUserState> DeferredStates;
+    bool bReceiving = false, bExplicitRefresh = false;
     bool bPreparing = false, bBusy = false;
     double NextRefresh = 0;
     TArray<TWeakObjectPtr<UCUUser>> Refresh;

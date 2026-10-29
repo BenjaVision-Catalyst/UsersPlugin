@@ -44,8 +44,8 @@ graph/4 transfer or non-Mac engine qualification is claimed.
 
 GemStone authorities deliver changes after commit. GT authorities deliver after
 volatile Runtime finalization, without claiming persistence/rollback. The feed
-reuses deferred replies, coalesces by User identity, and renews on change or a
-bounded lease heartbeat. Reconnect resubscribes/resnapshots; unknown mutations are
+coalesces finalized state by User identity and publishes over the persistent QUIC
+notification stream, with bounded backpressure and explicit session-scoped revocation. Reconnect resubscribes/resnapshots; unknown mutations are
 never automatically replayed. See service documentation for configurable feed
 limits and the dedicated `--push-only --authority gt` native qualification.
 

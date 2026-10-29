@@ -127,7 +127,10 @@ void UCUSubsystem::RefreshOne(UCUUser* User)
     FCUUserChange Request;
     Request.UserIdentifier = User->Replica.Identifier; Request.Name = User->Name; Request.ExpectedRevision = User->Replica.EditBase;
     Request.OperationIdentifier = Recovering ? User->CreationKey : FGuid::NewGuid().ToString();
-    if (Subscribing) { Request.OperationIdentifier = Selected->FeedKey; Request.ExpectedRevision = User->Replica.Revision; }
+    if (Subscribing) {
+        Request.OperationIdentifier = Selected->FeedKey; Request.ExpectedRevision = User->Replica.Revision;
+        Selected->Subscribed.Add(User->Replica.Identifier); // Push and watch replies use independent streams.
+    }
     const uint64 Sequence = User->Replica.EditSequence;
     TWeakObjectPtr<UCUSubsystem> Weak(this); TWeakObjectPtr<UCUUser> Target(User);
     Selected->Live[Recovering ? 3 : Updating ? 2 : Subscribing ? 4 : 1]->Call(this, Request,
@@ -136,6 +139,7 @@ void UCUSubsystem::RefreshOne(UCUUser* User)
             if (!Self || Self->Endpoint != Selected || !Self->bInitialized) { return; }
             Selected->bBusy = false;
             if (!User || User->Context.Get() != Self) { return; }
+            if (Subscribing) { Selected->Subscribed.Remove(User->Replica.Identifier); }
             ON_SCOPE_EXIT {
                 Selected->Updating.Remove(User);
                 if (auto* Deferred = Selected->DeferredStates.Find(User); Deferred && Deferred->Revision > User->Replica.Revision) { Self->Install(User, *Deferred); }
@@ -153,7 +157,10 @@ void UCUSubsystem::RefreshOne(UCUUser* User)
                 State.Outcome == TEXT("updated") || State.Outcome == TEXT("conflict") : State.Outcome == TEXT("current"))) {
                 User->Replica.Phase = ECCObjectReplicaPhase::Uncertain; Self->Report(User, ECUUserFabricError::IncompatibleState); return;
             }
-            if (Subscribing) { Selected->Subscribed.Add(User->Replica.Identifier); }
+            if (Subscribing) {
+                Selected->Subscribed.Add(User->Replica.Identifier);
+                if (State.Revision < User->Replica.Revision) { return; }
+            }
             TOptional<uint64> Sent;
             if (Recovering && State.Outcome == TEXT("created")) { Sent = User->CreationSequence; }
             if (Updating && State.Outcome == TEXT("updated")) { Sent = Sequence; }
@@ -191,6 +198,7 @@ void UCUSubsystem::Tick(float)
             }
         }
     }
+    if (Selected->Subscribed.IsEmpty() && Selected->bReceiving) { ResetFeed(); }
     if (Selected->RefreshIndex >= Selected->Refresh.Num()) {
         if ((!LivePolicy.bAutomaticRefresh && !bRefreshRequested) || Now < Selected->NextRefresh) { return; }
         Selected->Refresh = Tracked; Selected->RefreshIndex = 0; Selected->bExplicitRefresh = bRefreshRequested; bRefreshRequested = false;
@@ -220,20 +228,18 @@ void UCUSubsystem::ResetFeed()
         GetGameInstance()->GetSubsystem<UCCSubsystem>()->RetireRequest(Selected->Connection, Selected->ReceiveRequest.RequestId, Selected->ReceiveRequest.Generation);
     }
     Selected->ReceiveRequest = {}; Selected->bReceiving = false; Selected->FeedKey = FGuid::NewGuid().ToString();
-    Selected->AcknowledgedIdentifier.Empty(); Selected->AcknowledgedRevision = 0; Selected->Subscribed.Empty(); Selected->RecoveryAttempted.Empty();
+    Selected->Subscribed.Empty(); Selected->RecoveryAttempted.Empty();
 }
 void UCUSubsystem::ReceiveChanges()
 {
     auto Selected = Endpoint;
-    if (!LivePolicy.bAutomaticRefresh || Selected->bReceiving || Selected->Subscribed.IsEmpty()) { return; }
+    if (!LivePolicy.bAutomaticRefresh || Selected->bBusy || Selected->bReceiving || Selected->Subscribed.IsEmpty()) { return; }
     FCUUserChange Change; Change.OperationIdentifier = Selected->FeedKey;
-    Change.UserIdentifier = Selected->AcknowledgedIdentifier; Change.ExpectedRevision = Selected->AcknowledgedRevision;
     const uint64 Stamp = Selected->FeedGeneration; Selected->bReceiving = true;
     TWeakObjectPtr<UCUSubsystem> Weak(this);
     Selected->ReceiveRequest = Selected->Live[5]->Call(this, Change, [Weak, Selected, Stamp](TCCObjectResult<FCULiveUserState> Result) {
         auto* Self = Weak.Get();
         if (!Self || !Self->bInitialized || Self->Endpoint != Selected || Stamp != Selected->FeedGeneration) { return; }
-        Selected->bReceiving = false; Selected->ReceiveRequest = {};
         if (Result.Outcome != ECCObjectOutcome::Completed || !Result.Value.IsSet()) {
             for (auto Target : Self->Tracked) { if (auto* User = Target.Get()) {
                 if (User->Replica.Phase == ECCObjectReplicaPhase::Live) { User->Replica.Phase = ECCObjectReplicaPhase::Stale; }
@@ -242,14 +248,17 @@ void UCUSubsystem::ReceiveChanges()
             Selected->Generation = 0; Self->ResetFeed(); return;
         }
         const auto& State = Result.Value.GetValue();
-        if (State.Outcome == TEXT("renew")) { return; }
-        if (State.Outcome != TEXT("current") || !Selected->Subscribed.Contains(State.UserIdentifier)) { Selected->Generation = 0; Self->ResetFeed(); return; }
-        Selected->AcknowledgedIdentifier = State.UserIdentifier; Selected->AcknowledgedRevision = State.Revision;
+        if (State.Outcome == TEXT("subscribed")) { return; }
+        if (State.Outcome != TEXT("current")) { Selected->Generation = 0; Self->ResetFeed(); return; }
+        if (!Selected->Subscribed.Contains(State.UserIdentifier)) { return; } // Retired watches may have queued events.
         if (auto* WeakUser = Self->Identities.Find(State.UserIdentifier)) {
             if (auto* User = WeakUser->Get()) {
-                if (Selected->Updating.Contains(User)) { Selected->DeferredStates.Add(User, State); }
+                if (Selected->Updating.Contains(User)) {
+                    const auto* Deferred = Selected->DeferredStates.Find(User);
+                    if (!Deferred || State.Revision > Deferred->Revision) { Selected->DeferredStates.Add(User, State); }
+                }
                 else if (State.Revision > User->Replica.Revision) { Self->Install(User, State); }
             }
         }
-    });
+    }, true);
 }

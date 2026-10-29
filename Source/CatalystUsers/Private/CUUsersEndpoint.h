@@ -11,8 +11,7 @@ public:
     TArray<TSharedPtr<TCCObjectEndpoint<FCUUserChange, FCULiveUserState>>> Live;
     FName Connection;
     uint64 Generation = 0;
-    FString FeedKey, AcknowledgedIdentifier;
-    int64 AcknowledgedRevision = 0;
+    FString FeedKey;
     uint64 FeedGeneration = 0;
     FCCConnectRequestResult ReceiveRequest;
     TSet<FString> Subscribed;

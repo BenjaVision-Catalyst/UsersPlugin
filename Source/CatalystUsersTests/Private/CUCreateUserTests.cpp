@@ -210,8 +210,15 @@ bool FCUPushUserTest::RunTest(const FString&)
     TStrongObjectPtr<UCUUserOperation> Lookup{Observers->GetUser(Original->GetUserName())};
     if (!Wait([&] { return Lookup->IsFinished(); }) || Lookup->GetError() != ECUUserFabricError::None) { AddError(TEXT("Observer lookup failed")); return false; }
     auto Marker = [&](const TCHAR* File) { FFileHelper::SaveStringToFile(FString::Printf(TEXT("{\"prefix\":\"%s\"}"), *Prefix), *(Directory / File)); };
-    TStrongObjectPtr<UCUUser> Observed{Lookup->GetUser()}; Pause(.3);
-    Marker(TEXT("idle-start.json")); Pause(16); Marker(TEXT("idle-end.json"));
+    TStrongObjectPtr<UCUUser> Observed{Lookup->GetUser()};
+    if (!Wait([&] { return RemoteConnect->GetActiveSubscriptionCount(Name) == 1; })) { AddError(TEXT("Push setup did not complete")); return false; }
+    Pause(.3);
+    uint64 RequestsBefore = UINT64_MAX, RequestsAfter = UINT64_MAX;
+    TestTrue(TEXT("Native request count available"), Wait([&] { RequestsBefore = RemoteConnect->GetSubmittedRequestCount(Name); return RequestsBefore != UINT64_MAX; }));
+    Marker(TEXT("idle-start.json")); Pause(16);
+    TestTrue(TEXT("Native request count available after idle"), Wait([&] { RequestsAfter = RemoteConnect->GetSubmittedRequestCount(Name); return RequestsAfter != UINT64_MAX; }));
+    TestEqual(TEXT("Zero receive/renew or User-read requests while idle"), RequestsAfter, RequestsBefore);
+    Marker(TEXT("idle-end.json"));
     Original->SetUserName(Prefix + TEXT(":push-held")); Users->RefreshLiveUsers();
     TestTrue(TEXT("Change reaches observer after finalization"), Wait([&] { return !Original->HasPendingEdits() && Observed->GetUserName() == Prefix + TEXT(":push-held"); }));
 

@@ -1,0 +1,11 @@
+{
+  "FileVersion": 3, "Version": 1, "VersionName": "0.1.0",
+  "FriendlyName": "Catalyst:Users", "Category": "BenjaVision", "CreatedBy": "BenjaVision",
+  "Description": "Native described Users API through an authoritative Catalyst Users service.",
+  "CanContainContent": false, "IsExperimentalVersion": true,
+  "Plugins": [{ "Name": "CatalystFoundation", "Enabled": true }, { "Name": "CatalystConnect", "Enabled": true }],
+  "Modules": [
+    { "Name": "CatalystUsers", "Type": "Runtime", "LoadingPhase": "Default" },
+    { "Name": "CatalystUsersTests", "Type": "Editor", "LoadingPhase": "PostEngineInit" }
+  ]
+}

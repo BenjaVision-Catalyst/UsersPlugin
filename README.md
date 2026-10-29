@@ -1,30 +1,41 @@
 # Catalyst Users for Unreal Engine
 
-Catalyst Users for Unreal Engine is the planned client integration for games
-that need Catalyst accounts and user-related operations without implementing
-their own Catalyst message routing. This repository is currently a placeholder:
-there is no Unreal module, Blueprint API, or working account client to install
-yet.
+UE5.8 Users integration following the Catalyst Connect plugin template. The runtime
+module provides Blueprint-compatible `FCUUser` and per-GameInstance `UCUSubsystem`;
+a separate editor test module owns native qualification. There is no empty editor
+module or actor-owned socket. Foundation and Connect are plugin dependencies.
 
-## Planned role
+`FCUUser::MagritteDescription()` owns its native fields, validation/presentation
+metadata and accessors. The generic `TCCObjectEndpoint<FCUUser, FCUUser>` derives
+codecs and agreement from those descriptions. No Users network field list or
+codec is maintained. Peer bytes cannot select classes, accessors, routes or code.
 
-- Unreal-facing Users values and operations.
-- Communication through Catalyst Connect, with identity and account decisions
-  made by the authoritative Users service.
-- Client state and presentation integration for Unreal applications.
+Stage Connect's pinned Quinn and Magritte archives first, then install this repo
+as `Plugins/CatalystUsers` alongside `CatalystFoundation` and `CatalystConnect`.
+Enable `CatalystUsers`. Its module declares a GameInstance initialization dependency
+on the shared Connect subsystem.
 
-Implementation, wire contracts, engine compatibility, and packaging remain
-future work. The server component is also still being developed.
+The host configures/starts a named Connect connection. Obtain Users with
+`GameInstance->GetSubsystem<UCUSubsystem>()`, call `UseConnection(Name)`, and call
+`Prepare` after transport readiness. Then `CreateUser(User, Callback)` returns
+`Completed` with a native value only after the authoritative server's committed
+response. In Blueprint, consume the User argument only when Outcome is Completed;
+other outcomes carry the default empty struct. No automatic mutation replay occurs.
 
-## Installation and development
+The generic endpoint fences agreement to the connection generation and retains
+its immutable result schema until terminal observation. Explicit reconnect needs
+a fresh probe. Runtime-created default GemStone workers retain all service routing,
+capability checks and commit/rollback ownership. Account/tenant authorization and
+stable user identifiers remain server-domain work.
 
-Install the Catalyst development environment through
-[BVC](https://github.com/BenjaVisionPro/bvc#install). There is no functional
-package from this repository to install yet.
-
-Read the [component design](https://github.com/BenjaVisionPro/catalyst-workspace/blob/main/Users/Catalyst-Users-Design.md)
-for the intended scope and remaining integration work. Design documents describe
-the direction; they do not establish a released implementation.
+The `Catalyst.Users.Native.CreateUser` automation case uses the actual GameInstance
+subsystems and delegates against a configured authoritative Users service. It
+checks description agreement, a held pre-commit insertion, native result, rollback,
+super-user rejection, stale agreement and reconnect. The outside controller verifies
+visibility in independent Gem sessions and removes only its owned Runtime/users.
+See the service repository's `scripts/qualify-platform-users.py` and the checked-in
+platform qualification evidence. Mac arm64 UE5.8 is qualified; other engine/platform
+targets and interactive gameplay UI remain separate checks.
 
 ## License
 

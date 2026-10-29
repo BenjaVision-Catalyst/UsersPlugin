@@ -5,7 +5,7 @@
 namespace magritte { struct Description; }
 
 USTRUCT(BlueprintType)
-struct CATALYSTUSERS_API FCUUser
+struct CATALYSTUSERS_API FCUUserSnapshot
 {
     GENERATED_BODY()
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Catalyst|Users")
@@ -14,3 +14,6 @@ struct CATALYSTUSERS_API FCUUser
     bool bIsSuperUser = false;
     std::shared_ptr<magritte::Description> MagritteDescription() const;
 };
+
+// Legacy C++ source name; reflected snapshots and live UObject names remain distinct.
+using FCUUser = FCUUserSnapshot;

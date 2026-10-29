@@ -2,23 +2,32 @@
 #include "CCObjectEndpoint.h"
 #include "Model/CUUserLookup.h"
 #include "Engine/GameInstance.h"
-class FCCUsersEndpoint
-{
-public:
-    TSharedPtr<TCCObjectEndpoint<FCUUser, FCUUser>> Binding;
-    TSharedPtr<TCCObjectEndpoint<FCUUserLookup, FCUUser>> Lookup;
-};
+#include "CUUsersEndpoint.h"
+UCUSubsystem::UCUSubsystem() : FTickableGameObject(ETickableTickType::Never) {}
 UCUSubsystem::~UCUSubsystem() = default;
 void UCUSubsystem::Initialize(FSubsystemCollectionBase& Collection)
-{ Collection.InitializeDependency<UCCSubsystem>(); Super::Initialize(Collection); }
-void UCUSubsystem::Deinitialize() { Endpoint.Reset(); Super::Deinitialize(); }
+{ Collection.InitializeDependency<UCCSubsystem>(); Super::Initialize(Collection); bInitialized = true; SetTickableTickType(ETickableTickType::Conditional); }
+void UCUSubsystem::Deinitialize()
+{
+    bInitialized = false; SetTickableTickType(ETickableTickType::Never);
+    auto Pending = Operations; Operations.Empty();
+    for (auto Operation : Pending) { FailOperation(Operation, ECUUserFabricError::Unknown); }
+    for (auto Weak : Tracked) { if (auto* User = Weak.Get()) { User->Replica.Phase = ECCObjectReplicaPhase::Stale; User->OnChanged.Broadcast(User); } }
+    Tracked.Empty(); Identities.Empty(); Endpoint.Reset(); Super::Deinitialize();
+}
 bool UCUSubsystem::UseConnection(FName Name)
 {
     check(IsInGameThread());
+    if (Operations.Num() || Tracked.ContainsByPredicate([](const auto& W) { return W.IsValid(); })) { return false; }
     auto Bound = TCCObjectEndpoint<FCUUser, FCUUser>::Create(GetGameInstance()->GetSubsystem<UCCSubsystem>(), Name, 1);
     auto Lookup = TCCObjectEndpoint<FCUUserLookup, FCUUser>::Create(GetGameInstance()->GetSubsystem<UCCSubsystem>(), Name, 2);
     if (!Bound || !Lookup) { return false; }
-    Endpoint = MakeShared<FCCUsersEndpoint>(); Endpoint->Binding = Bound; Endpoint->Lookup = Lookup; return true;
+    Endpoint = MakeShared<FCCUsersEndpoint>(); Endpoint->Binding = Bound; Endpoint->Lookup = Lookup; Endpoint->Connection = Name;
+    for (uint16 Code = 3; Code <= 6; ++Code) {
+        auto Live = TCCObjectEndpoint<FCUUserChange, FCULiveUserState>::Create(GetGameInstance()->GetSubsystem<UCCSubsystem>(), Name, Code, ECCObjectProfile::StateV2);
+        if (!Live) { Endpoint.Reset(); return false; } Endpoint->Live.Add(Live);
+    }
+    return true;
 }
 void UCUSubsystem::Prepare(FCUUsersReady Callback)
 {
@@ -34,7 +43,7 @@ void UCUSubsystem::Prepare(FCUUsersReady Callback)
         });
     });
 }
-void UCUSubsystem::CreateUser(const FCUUser& User, FCUUserCreated Callback)
+void UCUSubsystem::CreateUserSnapshot(const FCUUser& User, FCUUserCreated Callback)
 {
     check(IsInGameThread());
     if (!Endpoint) { Callback.ExecuteIfBound(ECUUserOutcome::Unavailable, FCUUser{}); return; }
@@ -43,7 +52,7 @@ void UCUSubsystem::CreateUser(const FCUUser& User, FCUUserCreated Callback)
     });
 }
 
-void UCUSubsystem::GetUser(const FString& Name, FCUUserFound Callback)
+void UCUSubsystem::GetUserSnapshot(const FString& Name, FCUUserFound Callback)
 {
     check(IsInGameThread());
     if (!Endpoint) { Callback.ExecuteIfBound(ECUUserOutcome::Unavailable, FCUUser{}); return; }

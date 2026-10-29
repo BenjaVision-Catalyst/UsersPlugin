@@ -50,9 +50,10 @@ bool FCUCreateUserTest::RunTest(const FString&)
     const FName Name(TEXT("Users"));
     TestTrue(TEXT("Configured transport"), Connect->ConfigureConnection(Name, Profile) == ECCConnectResult::Ok);
     TestTrue(TEXT("Start"), Connect->StartConnection(Name) == ECCConnectResult::Ok);
+    UCCSubsystem* RemoteConnect = nullptr; UCUSubsystem* RemoteUsers = nullptr;
     auto Wait = [&](TFunction<bool()> Done) {
         const double Deadline = FPlatformTime::Seconds() + 25;
-        while (!Done() && FPlatformTime::Seconds() < Deadline) { Connect->Tick(0); FPlatformProcess::SleepNoStats(.001f); }
+        while (!Done() && FPlatformTime::Seconds() < Deadline) { Connect->Tick(0); Users->Tick(0); if (RemoteConnect) { RemoteConnect->Tick(0); RemoteUsers->Tick(0); } FPlatformProcess::SleepNoStats(.001f); }
         return Done();
     };
     if (!Wait([&] { return Connect->GetConnectionState(Name) == ECCConnectState::Ready; })) { AddError(TEXT("Secure connection unavailable")); return false; }
@@ -121,6 +122,55 @@ bool FCUCreateUserTest::RunTest(const FString&)
     Input.Name = Options->GetStringField(TEXT("reconnectedName")); Count = Probe->Replies; Users->CreateUser(Input, Created);
     TestTrue(TEXT("Reconnected native result"), Wait([&] { return Probe->Replies == Count + 1; }) && Probe->Outcome == ECUUserOutcome::Completed && Probe->Value.Name == Input.Name);
     Lookup(Input.Name, ECUUserOutcome::Completed, Input.Name);
+    FCULiveUserPolicy Policy; Policy.bAutomaticRefresh = false; Policy.RefreshInterval = .05f;
+    TestTrue(TEXT("Manual refresh policy"), Users->ConfigureLiveUsers(Policy));
+    TStrongObjectPtr<UCUUser> Live{NewObject<UCUUser>(Instance.Game.Get())}; Live->SetUserName(Prefix + TEXT(":live"));
+    TStrongObjectPtr<UCUUserOperation> Adopt{Users->CreateUser(Live.Get())};
+    Live->SetUserName(Prefix + TEXT(":live-edited"));
+    TestTrue(TEXT("Confirmed creation adopts original object"), Wait([&] { return Adopt->IsFinished(); }) && Adopt->GetError() == ECUUserFabricError::None && Adopt->GetUser() == Live.Get());
+    TestTrue(TEXT("Identity and newer local edit retained"), !Live->GetUserIdentifier().IsEmpty() && Live->GetRevision() == 1 && Live->HasPendingEdits());
+    Users->RefreshLiveUsers(); TestTrue(TEXT("Pending edit commits"), Wait([&] { return !Live->HasPendingEdits(); }) && Live->GetRevision() == 2);
+    TStrongObjectPtr<UCUUserOperation> Cached{Users->GetUser(Live->GetUserName())};
+    TestTrue(TEXT("Lookup shares scoped identity map"), Wait([&] { return Cached->IsFinished(); }) && Cached->GetUser() == Live.Get());
+    FInstance RemoteInstance;
+    RemoteConnect = RemoteInstance.Game->GetSubsystem<UCCSubsystem>(); RemoteUsers = RemoteInstance.Game->GetSubsystem<UCUSubsystem>();
+    RemoteConnect->ConfigureConnection(Name, Profile); RemoteConnect->StartConnection(Name);
+    TestTrue(TEXT("Second native scope ready"), Wait([&] { return RemoteConnect->GetConnectionState(Name) == ECCConnectState::Ready; }));
+    RemoteUsers->UseConnection(Name); FCULiveUserPolicy RemotePolicy = Policy; RemotePolicy.bAutomaticRefresh = true; RemoteUsers->ConfigureLiveUsers(RemotePolicy);
+    TStrongObjectPtr<UCUUserOperation> LookedUp{RemoteUsers->GetUser(Live->GetUserName())};
+    if (!Wait([&] { return LookedUp->IsFinished(); }) || LookedUp->GetError() != ECUUserFabricError::None) { AddError(TEXT("Remote lookup failed")); return false; }
+    TStrongObjectPtr<UCUUser> Other{LookedUp->GetUser()};
+    TestTrue(TEXT("Identity stable across scopes"), Other.Get() != Live.Get() && Other->GetUserIdentifier() == Live->GetUserIdentifier());
+    Live->SetUserName(Prefix + TEXT(":live-remote")); Users->RefreshLiveUsers();
+    TestTrue(TEXT("Automatic remote refresh"), Wait([&] { return Other->GetUserName() == Live->GetUserName(); }));
+    Live->SetUserName(Prefix + TEXT(":live-local-draft")); Other->SetUserName(Prefix + TEXT(":live-authority"));
+    TestTrue(TEXT("Automatic edit submission"), Wait([&] { return !Other->HasPendingEdits(); }));
+    Users->RefreshLiveUsers();
+    TestTrue(TEXT("Conflict preserves local draft"), Wait([&] { return Live->GetSyncState() == ECCObjectReplicaPhase::Conflict; }) && Live->GetUserName() == Prefix + TEXT(":live-local-draft"));
+    Users->ResolveConflict(Live.Get(), false);
+    TestTrue(TEXT("Explicit remote resolution"), Live->GetUserName() == Prefix + TEXT(":live-authority") && !Live->HasPendingEdits());
+    RemotePolicy.bAutomaticRefresh = false; RemoteUsers->ConfigureLiveUsers(RemotePolicy); RemoteConnect->StopConnection(Name);
+    TStrongObjectPtr<UCUUser> Rollback{NewObject<UCUUser>(Instance.Game.Get())}; Rollback->SetUserName(Prefix + TEXT(":live-rollback"));
+    TStrongObjectPtr<UCUUserOperation> RollbackOperation{Users->CreateUser(Rollback.Get())};
+    TestTrue(TEXT("Live failed transaction remains unknown"), Wait([&] { return RollbackOperation->IsFinished(); }) && RollbackOperation->GetError() == ECUUserFabricError::Unknown);
+    Users->RefreshLiveUsers();
+    TStrongObjectPtr<UCUUserOperation> RollbackLookup{Users->GetUser(Rollback->GetUserName())};
+    TestTrue(TEXT("Rolled back live object absent"), Wait([&] { return RollbackLookup->IsFinished(); }) && RollbackLookup->GetError() == ECUUserFabricError::NotFound);
+    Policy.bAutomaticRefresh = true; Users->ConfigureLiveUsers(Policy);
+    TStrongObjectPtr<UCUUser> Lost{NewObject<UCUUser>(Instance.Game.Get())}; Lost->SetUserName(Prefix + TEXT(":lost-create"));
+    TStrongObjectPtr<UCUUserOperation> LostOperation{Users->CreateUser(Lost.Get())};
+    const double CloseAt = FPlatformTime::Seconds() + 1;
+    Wait([&] { return FPlatformTime::Seconds() >= CloseAt; }); Connect->StopConnection(Name);
+    TestTrue(TEXT("Lost reply is unknown"), Wait([&] { return LostOperation->IsFinished(); }) && LostOperation->GetError() == ECUUserFabricError::Unknown && Lost->GetUserIdentifier().IsEmpty());
+    FFileHelper::SaveStringToFile(FString::Printf(TEXT("{\"prefix\":\"%s\"}"), *Prefix), *(Directory / TEXT("live-disconnected.json")));
+    Lost->SetUserName(Prefix + TEXT(":recovered-edit")); Connect->StartConnection(Name);
+    TestTrue(TEXT("Recovery automatically adopts original object and submits newer edit"), Wait([&] { return !Lost->GetUserIdentifier().IsEmpty() && !Lost->HasPendingEdits(); }) && Lost->GetSyncState() == ECCObjectReplicaPhase::Live && Lost->GetUserName() == Prefix + TEXT(":recovered-edit"));
+    TStrongObjectPtr<UCUUserOperation> Recovered{Users->GetUser(Lost->GetUserName())};
+    TestTrue(TEXT("Recovered identity cached"), Wait([&] { return Recovered->IsFinished(); }) && Recovered->GetUser() == Lost.Get());
+    FCCObjectReplicaState Uncertain; Uncertain.Accept(TEXT("id"), 1); Uncertain.Edited(); Uncertain.Phase = ECCObjectReplicaPhase::Uncertain;
+    Uncertain.Accept(TEXT("id"), 1); TestTrue(TEXT("A read never authorizes replay"), Uncertain.Phase == ECCObjectReplicaPhase::Uncertain);
+    Uncertain.Accept(TEXT("id"), 2); TestTrue(TEXT("A changed read never authorizes replay"), Uncertain.Phase == ECCObjectReplicaPhase::Uncertain);
+    UE_LOG(LogTemp, Display, TEXT("CU_LIVE_RESULT %s adopted stable-identity shared-cache auto-refresh conflict lost-create-recovered rollback-absent"), *Prefix);
     return true;
 }
 #endif

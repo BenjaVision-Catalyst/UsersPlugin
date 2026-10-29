@@ -22,6 +22,12 @@ The host configures/starts a named Connect connection. Obtain Users with
 response. In Blueprint, consume the User argument only when Outcome is Completed;
 other outcomes carry the default empty struct. No automatic mutation replay occurs.
 
+Call `GetUser(ExactName, Callback)` for exact, case-sensitive lookup. `Completed`
+carries the native user, `NotFound` means explicit absence, and `Refused` includes
+ambiguous names. No default user is substituted. Enable server operations 1, 2 and
+65534; `Prepare` establishes both agreements. The name-only lookup request reuses
+`FCUUser` name metadata and the result uses the unchanged user description.
+
 The generic endpoint fences agreement to the connection generation and retains
 its immutable result schema until terminal observation. Explicit reconnect needs
 a fresh probe. Runtime-created default GemStone workers retain all service routing,

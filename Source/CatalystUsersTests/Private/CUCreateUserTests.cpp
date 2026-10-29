@@ -63,6 +63,9 @@ bool FCUCreateUserTest::RunTest(const FString&)
     FCUUser Input; Input.Name = Prefix + TEXT(":not-ready");
     Users->CreateUser(Input, Created);
     TestTrue(TEXT("Readiness required"), Probe->Outcome == ECUUserOutcome::Unavailable);
+    FCUUserFound Found; Found.BindDynamic(Probe.Get(), &UCUPlatformProbe::Created);
+    Users->GetUser(TEXT("admin"), Found);
+    TestTrue(TEXT("Lookup readiness required"), Probe->Outcome == ECUUserOutcome::Unavailable);
     Users->Prepare(Ready);
     if (!Wait([&] { return Probe->ReadyCalls == 1; }) || !Probe->bReady) { AddError(TEXT("Magritte/service probe failed")); return false; }
     FString Error; auto Schema = FCCObjectSchema::Freeze(*Input.MagritteDescription(), Error);
@@ -79,20 +82,45 @@ bool FCUCreateUserTest::RunTest(const FString&)
     if (Probe->Outcome != ECUUserOutcome::Completed) { return false; }
     // The outside controller verifies this marker appears only after the gate is released.
     FFileHelper::SaveStringToFile(TEXT("{\"nativeType\":\"FCUUser\",\"completed\":true}"), *(Directory / TEXT("client-success.json")));
+    auto Lookup = [&](const FString& Query, ECUUserOutcome Expected, const FString& ResultName, bool Super = false) {
+        const int32 Replies = Probe->Replies;
+        Users->GetUser(Query, Found);
+        const bool Finished = Wait([&] { return Probe->Replies == Replies + 1; });
+        TestTrue(TEXT("Lookup outcome"), Finished && Probe->Outcome == Expected);
+        if (Expected == ECUUserOutcome::Completed) {
+            TestEqual(TEXT("Lookup native name"), Probe->Value.Name, ResultName);
+            TestTrue(TEXT("Lookup native super-user flag"), Probe->Value.bIsSuperUser == Super);
+        } else { TestTrue(TEXT("Non-success has no user"), Probe->Value.Name.IsEmpty() && !Probe->Value.bIsSuperUser); }
+    };
+    Lookup(Input.Name, ECUUserOutcome::Completed, Input.Name);
+    Lookup(Prefix + TEXT(":missing"), ECUUserOutcome::NotFound, TEXT(""));
+    Lookup(Input.Name.ToUpper(), ECUUserOutcome::NotFound, TEXT(""));
+    Lookup(TEXT("admin"), ECUUserOutcome::Completed, TEXT("admin"), true);
+    Lookup(TEXT("unknownUser"), ECUUserOutcome::Completed, TEXT("unknownUser"));
+    Input.Name = Prefix + TEXT(":duplicate");
+    for (int32 I = 0; I < 2; ++I) {
+        int32 Replies = Probe->Replies; Users->CreateUser(Input, Created);
+        TestTrue(TEXT("Duplicate-name fixture created"), Wait([&] { return Probe->Replies == Replies + 1; }) && Probe->Outcome == ECUUserOutcome::Completed);
+    }
+    Lookup(Input.Name, ECUUserOutcome::Refused, TEXT(""));
     Input.Name = Prefix + TEXT(":rollback");
     int32 Count = Probe->Replies; Users->CreateUser(Input, Created);
     TestTrue(TEXT("Post-insertion rollback cannot return a user"), Wait([&] { return Probe->Replies == Count + 1; }) && Probe->Outcome == ECUUserOutcome::Unknown);
     Input.Name = Prefix + TEXT(":super"); Input.bIsSuperUser = true;
     Count = Probe->Replies; Users->CreateUser(Input, Created);
     TestTrue(TEXT("Super-user rejection cannot return a user"), Wait([&] { return Probe->Replies == Count + 1; }) && Probe->Outcome == ECUUserOutcome::Unknown);
+    Lookup(Prefix + TEXT(":rollback"), ECUUserOutcome::NotFound, TEXT(""));
     Connect->StopConnection(Name); Connect->StartConnection(Name);
     TestTrue(TEXT("Explicit reconnect"), Wait([&] { return Connect->GetConnectionState(Name) == ECCConnectState::Ready; }));
     Input.Name = Prefix + TEXT(":stale"); Input.bIsSuperUser = false; Users->CreateUser(Input, Created);
     TestTrue(TEXT("Old agreement cannot cross activations"), Probe->Outcome == ECUUserOutcome::Unavailable);
+    Users->GetUser(TEXT("admin"), Found);
+    TestTrue(TEXT("Lookup cannot reuse stale agreement"), Probe->Outcome == ECUUserOutcome::Unavailable);
     Users->Prepare(Ready);
     TestTrue(TEXT("Fresh description/service probe"), Wait([&] { return Probe->ReadyCalls == 2; }) && Probe->bReady);
     Input.Name = Options->GetStringField(TEXT("reconnectedName")); Count = Probe->Replies; Users->CreateUser(Input, Created);
     TestTrue(TEXT("Reconnected native result"), Wait([&] { return Probe->Replies == Count + 1; }) && Probe->Outcome == ECUUserOutcome::Completed && Probe->Value.Name == Input.Name);
+    Lookup(Input.Name, ECUUserOutcome::Completed, Input.Name);
     return true;
 }
 #endif

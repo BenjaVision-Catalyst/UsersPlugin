@@ -4,9 +4,10 @@
 #include "CUSubsystem.generated.h"
 class FCCUsersEndpoint;
 UENUM(BlueprintType)
-enum class ECUUserOutcome : uint8 { Completed, InvalidInput, Unavailable, Refused, Unknown };
+enum class ECUUserOutcome : uint8 { Completed, InvalidInput, Unavailable, Refused, Unknown, NotFound };
 DECLARE_DYNAMIC_DELEGATE_OneParam(FCUUsersReady, bool, Ready);
 DECLARE_DYNAMIC_DELEGATE_TwoParams(FCUUserCreated, ECUUserOutcome, Outcome, const FCUUser&, User);
+DECLARE_DYNAMIC_DELEGATE_TwoParams(FCUUserFound, ECUUserOutcome, Outcome, const FCUUser&, User);
 
 /** Per-GameInstance Users API. The configured Connect connection is shared and caller owned. */
 UCLASS()
@@ -23,6 +24,8 @@ public:
     void Prepare(FCUUsersReady Callback);
     UFUNCTION(BlueprintCallable, Category="Catalyst|Users")
     void CreateUser(const FCUUser& User, FCUUserCreated Callback);
+    UFUNCTION(BlueprintCallable, Category="Catalyst|Users")
+    void GetUser(const FString& Name, FCUUserFound Callback);
 private:
     TSharedPtr<FCCUsersEndpoint> Endpoint;
 };
